@@ -277,6 +277,7 @@ var behaviors = {
 				for(var attrName in onTeardowns) {
 					onTeardowns[attrName]();
 				}
+				onCompleteBindings = [];
 			};
 		},
 		// ### bindings.behaviors.data
