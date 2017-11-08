@@ -29,6 +29,7 @@ var attr = require('can-util/dom/attr/attr');
 var stacheHelperCore = require("can-stache/helpers/core");
 var canSymbol = require("can-symbol");
 var canReflect = require("can-reflect");
+var mutateDeps = require('can-reflect-mutate-dependencies');
 var singleReference = require("can-util/js/single-reference/single-reference");
 var encoder = require("can-attribute-encoder");
 var queues = require("can-queues");
@@ -89,7 +90,10 @@ var onMatchStr = "on:",
 	getValueSymbol = canSymbol.for("can.getValue"),
 	setValueSymbol = canSymbol.for("can.setValue"),
 	onValueSymbol = canSymbol.for("can.onValue"),
-	offValueSymbol = canSymbol.for("can.offValue");
+	offValueSymbol = canSymbol.for("can.offValue"),
+	getWhatIChangeSymbol = canSymbol.for("can.getWhatIChange"),
+	getChangesSymbol = canSymbol.for("can.getChangesDependencyRecord"),
+	valueHasDependenciesSymbol = canSymbol.for("can.valueHasDependencies");
 
 
 var throwOnlyOneTypeOfBindingError = function(){
@@ -553,11 +557,36 @@ var getObservableFrom = {
 				var parentExpression = expression.parse(scopeProp,{baseMethodType: "Call"});
 				return parentExpression.value(scope, new Scope.Options({}));
 			} else {
-				var observation = new Observation(function() {});
+				var observation = {};
 
-				observation[setValueSymbol] = function(newVal) {
+				observation[getValueSymbol] = function() {};
+
+				observation[valueHasDependenciesSymbol] = function() {
+					return false;
+				};
+
+				observation[setValueSymbol] = function setValue(newVal) {
 					scope.set(cleanVMName(scopeProp), newVal);
 				};
+
+				// Register what the custom observation changes
+				observation[getWhatIChangeSymbol] = function() {
+					var data = scope.getDataForScopeSet(cleanVMName(scopeProp));
+
+					return {
+						mutate: {
+							keyDependencies: new Map([
+								[data.parent, new Set([data.key])]
+							])
+						}
+					};
+				};
+
+				// Register what changes the Scope's parent key
+				var data = scope.getDataForScopeSet(cleanVMName(scopeProp));
+				if (data.parent && data.key) {
+					mutateDeps.addMutatedBy(data.parent, data.key, observation);
+				}
 
 				return observation;
 			}
@@ -605,7 +634,7 @@ var getObservableFrom = {
 	},
 	// ### getObservableFrom.attribute
 	// Returns a compute that is two-way bound to an attribute or property on the element.
-	attribute: function(el, scope, prop, bindingData, mustBeSettable, stickyCompute, event) {
+	attribute: function(el, scope, prop, bindingData, mustBeSettable, stickyCompute, event, bindingInfo) {
 		// Determine the event or events we need to listen to
 		// when this value changes.
 		if(!event) {
@@ -648,7 +677,10 @@ var getObservableFrom = {
 			observation[setValueSymbol] = set;
 			observation[getValueSymbol] = get;
 
+			var onValue = observation[onValueSymbol];
 			observation[onValueSymbol] = function(updater) {
+				onValue.apply(this, arguments);
+
 				var translationHandler = function() {
 					updater(get());
 				};
@@ -661,7 +693,9 @@ var getObservableFrom = {
 				canEvent.on.call(el, event, translationHandler);
 			};
 
+			var offValue = observation[offValueSymbol];
 			observation[offValueSymbol] = function(updater) {
+				offValue.apply(this, arguments);
 				var translationHandler = singleReference.getAndDelete(updater, this);
 
 				if (event === "radiochange") {
@@ -671,7 +705,36 @@ var getObservableFrom = {
 				canEvent.off.call(el, event, translationHandler);
 			};
 
-			return observation;
+		//!steal-remove-start
+		Object.defineProperty(get, "name", {
+			value: el.nodeName.toLowerCase() + ":" +
+				((bindingInfo && bindingInfo.bindingAttributeName) || prop)
+		});
+
+		mutateDeps.addMutatedBy(el, prop, observation);
+
+		var obsDeps = canReflect.getValueDependencies(observation);
+		observation[canSymbol.for('can.getValueDependencies')] = function() {
+			obsDeps = obsDeps == null ? {} : obsDeps;
+
+			if (obsDeps.keyDependencies) {
+				var entry = obsDeps.keyDependencies.get(el);
+				if (!entry) {
+					entry = new Set();
+					obsDeps.keyDependencies.set(el, entry);
+				}
+				entry.add(prop);
+			} else {
+				obsDeps.keyDependencies = new Map([
+					[el, new Set([prop])]
+				]);
+			}
+
+			return obsDeps;
+		};
+		//!steal-remove-end
+
+		return observation;
 	}
 };
 
@@ -735,7 +798,16 @@ var bind = {
 		//!steal-remove-end
 
 		if(childObservable && childObservable[getValueSymbol]) {
-			canReflect.onValue(childObservable, updateParent,"domUI");
+			canReflect.onValue(childObservable, updateParent, "domUI");
+
+			//!steal-remove-start
+			updateParent[getChangesSymbol] = function() {
+				return {
+					valueDependencies: new Set([ parentObservable ])
+				};
+			};
+			mutateDeps.addMutatedBy(parentObservable, childObservable);
+			//!steal-remove-end
 		}
 
 		return updateParent;
@@ -764,7 +836,10 @@ var bind = {
 		//!steal-remove-end
 
 		if(parentObservable && parentObservable[getValueSymbol]) {
-			canReflect.onValue(parentObservable, updateChild,"domUI");
+			canReflect.onValue(parentObservable, updateChild, "domUI");
+			//!steal-remove-start
+			mutateDeps.addMutatedBy(childObservable, parentObservable);
+			//!steal-remove-end
 		}
 
 		return updateChild;
@@ -918,7 +993,8 @@ var getBindingInfo = function(node, attributeViewModelBindings, templateType, ta
 // - `object` - An object with information about the binding.
 var makeDataBinding = function(node, el, bindingData) {
 	// Get information about the binding.
-	var bindingInfo = getBindingInfo(node, bindingData.attributeViewModelBindings, bindingData.templateType, el.nodeName.toLowerCase(), bindingData.favorViewModel);
+	var bindingInfo = getBindingInfo(node, bindingData.attributeViewModelBindings,
+		bindingData.templateType, el.nodeName.toLowerCase(), bindingData.favorViewModel);
 	if(!bindingInfo) {
 		return;
 	}

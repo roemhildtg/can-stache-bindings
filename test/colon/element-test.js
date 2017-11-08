@@ -1,5 +1,6 @@
 var QUnit = require('steal-qunit');
 var testHelpers = require('../helpers');
+var mutateDeps = require('can-reflect-mutate-dependencies');
 
 require('can-stache-bindings');
 
@@ -1256,5 +1257,30 @@ testHelpers.makeTests("can-stache-bindings - colon - element", function(name, do
 		QUnit.equal(frag.childNodes[0].childNodes[0].nodeValue, '', "demoContext person set correctly");
 		QUnit.equal(frag.childNodes[1].childNodes[0].childNodes[0].nodeValue, 'John', "source-component person set correctly");
 		QUnit.equal(frag.childNodes[2].childNodes[1].childNodes[0].nodeValue, '', "clear-button person set correctly");
+	});
+
+	QUnit.test("cross binding mutation dependencies", function(assert) {
+		var template = stache("<input value:bind='age'>");
+
+		var map = new SimpleMap();
+		var frag = template(map);
+
+		var ta = this.fixture;
+		ta.appendChild(frag);
+
+		var input = ta.getElementsByTagName("input")[0];
+		var inputDeps = mutateDeps.getKeyDependencies(input, "value");
+		assert.ok(
+			inputDeps.mutatedValueDependencies.size,
+			"should have mutation dependencies"
+		);
+
+		var mutatedDep = Array.from(inputDeps.mutatedValueDependencies)[0];
+		var obsDeps = canReflect.getValueDependencies(mutatedDep);
+		assert.ok(
+			obsDeps.keyDependencies.size,
+			"should have key dependencies"
+		);
+		assert.ok(obsDeps.keyDependencies.get(input).has("value"));
 	});
 });
